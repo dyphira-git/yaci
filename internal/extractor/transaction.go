@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"github.com/manifest-network/yaci/internal/client"
 	"github.com/manifest-network/yaci/internal/models"
@@ -47,6 +48,22 @@ func extractTransactions(gRPCClient *client.GRPCClient, data map[string]interfac
 			maxRetries,
 			txJsonParams,
 		)
+
+		// Store error metadata instead of failing block processing
+		// Handles oversized transactions (e.g., Mantrachain) and transient failures
+		if err != nil {
+			errorJSON := []byte(fmt.Sprintf(`{"error": "failed to fetch transaction details", "hash": "%s", "reason": %q}`, hashStr, err.Error()))
+			transaction := &models.Transaction{
+				Hash: hashStr,
+				Data: errorJSON,
+			}
+			transactions = append(transactions, transaction)
+
+			slog.Warn("Failed to fetch transaction details, storing with error metadata",
+				"hash", hashStr,
+				"error", err)
+			continue
+		}
 
 		transaction := &models.Transaction{
 			Hash: hashStr,
