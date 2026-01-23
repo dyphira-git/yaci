@@ -1,19 +1,14 @@
 name: Deploy to Fly.io
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types:
-      - completed
-    branches:
-      - main
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   deploy:
     name: Deploy Indexer
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
