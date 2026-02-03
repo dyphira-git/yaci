@@ -148,6 +148,17 @@ func (h *PostgresOutputHandler) WriteBlockWithTransactions(ctx context.Context, 
 	return nil
 }
 
+func (h *PostgresOutputHandler) WriteBlockResults(ctx context.Context, blockResults *models.BlockResults) error {
+	_, err := h.pool.Exec(ctx, `
+		INSERT INTO api.block_results_raw (height, data) VALUES ($1, $2)
+		ON CONFLICT (height) DO UPDATE SET data = EXCLUDED.data;
+	`, blockResults.Height, blockResults.Data)
+	if err != nil {
+		return fmt.Errorf("failed to write block results: %w", err)
+	}
+	return nil
+}
+
 func (h *PostgresOutputHandler) runMigrations() error {
 	// Create tables if they don't exist
 	slog.Info("Running PostgreSQL migrations...")
