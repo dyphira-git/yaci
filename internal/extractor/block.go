@@ -17,7 +17,7 @@ import (
 )
 
 // extractBlocksAndTransactions extracts blocks and transactions from the gRPC server.
-func extractBlocksAndTransactions(gRPCClient *client.GRPCClient, start, stop uint64, outputHandler output.OutputHandler, maxConcurrency, maxRetries uint) error {
+func extractBlocksAndTransactions(gRPCClient *client.GRPCClient, start, stop uint64, outputHandler output.OutputHandler, cfg config.ExtractConfig) error {
 	displayProgress := start != stop
 	if displayProgress {
 		slog.Info("Extracting blocks and transactions", "range", fmt.Sprintf("[%d, %d]", start, stop))
@@ -45,7 +45,7 @@ func extractBlocksAndTransactions(gRPCClient *client.GRPCClient, start, stop uin
 		}
 	}
 
-	if err := processBlocks(gRPCClient, start, stop, outputHandler, maxConcurrency, maxRetries, bar); err != nil {
+	if err := processBlocks(gRPCClient, start, stop, outputHandler, cfg, bar); err != nil {
 		return fmt.Errorf("failed to process blocks and transactions: %w", err)
 	}
 
@@ -68,8 +68,14 @@ func processMissingBlocks(gRPCClient *client.GRPCClient, outputHandler output.Ou
 	if len(missingBlockIds) > 0 {
 		slog.Warn("Missing blocks detected", "count", len(missingBlockIds))
 		for _, blockID := range missingBlockIds {
-			if err := processSingleBlockWithRetry(gRPCClient, blockID, outputHandler, cfg.MaxRetries); err != nil {
-				return fmt.Errorf("failed to process missing block %d: %w", blockID, err)
+			var processErr error
+			if cfg.EnableBlockResults {
+				processErr = processSingleBlockWithResultsAndRetry(gRPCClient, blockID, outputHandler, cfg.MaxRetries)
+			} else {
+				processErr = processSingleBlockWithRetry(gRPCClient, blockID, outputHandler, cfg.MaxRetries)
+			}
+			if processErr != nil {
+				return fmt.Errorf("failed to process missing block %d: %w", blockID, processErr)
 			}
 		}
 	}
@@ -77,9 +83,9 @@ func processMissingBlocks(gRPCClient *client.GRPCClient, outputHandler output.Ou
 }
 
 // processBlocks processes blocks in parallel using goroutines.
-func processBlocks(gRPCClient *client.GRPCClient, start, stop uint64, outputHandler output.OutputHandler, maxConcurrency, maxRetries uint, bar *progressbar.ProgressBar) error {
+func processBlocks(gRPCClient *client.GRPCClient, start, stop uint64, outputHandler output.OutputHandler, cfg config.ExtractConfig, bar *progressbar.ProgressBar) error {
 	eg, ctx := errgroup.WithContext(gRPCClient.Ctx)
-	sem := make(chan struct{}, maxConcurrency)
+	sem := make(chan struct{}, cfg.MaxConcurrency)
 
 	for height := start; height <= stop; height++ {
 		if ctx.Err() != nil {
@@ -99,7 +105,15 @@ func processBlocks(gRPCClient *client.GRPCClient, start, stop uint64, outputHand
 		eg.Go(func() error {
 			defer func() { <-sem }()
 
-			err := processSingleBlockWithRetry(clientWithCtx, blockHeight, outputHandler, maxRetries)
+			var err error
+			if cfg.EnableBlockResults {
+				// Fetch blocks, transactions, AND block results (finalize_block_events)
+				err = processSingleBlockWithResultsAndRetry(clientWithCtx, blockHeight, outputHandler, cfg.MaxRetries)
+			} else {
+				// Standard extraction: blocks and transactions only
+				err = processSingleBlockWithRetry(clientWithCtx, blockHeight, outputHandler, cfg.MaxRetries)
+			}
+
 			if err != nil {
 				if !errors.Is(err, context.Canceled) {
 					slog.Error("Block processing error",
@@ -108,7 +122,7 @@ func processBlocks(gRPCClient *client.GRPCClient, start, stop uint64, outputHand
 						"errorType", fmt.Sprintf("%T", err))
 					return err
 				}
-				slog.Error("Failed to process block", "height", blockHeight, "error", err, "retries", maxRetries)
+				slog.Error("Failed to process block", "height", blockHeight, "error", err, "retries", cfg.MaxRetries)
 				return fmt.Errorf("failed to process block %d: %w", blockHeight, err)
 			}
 
@@ -164,6 +178,52 @@ func processSingleBlockWithRetry(gRPCClient *client.GRPCClient, blockHeight uint
 	err = outputHandler.WriteBlockWithTransactions(gRPCClient.Ctx, block, transactions)
 	if err != nil {
 		return fmt.Errorf("failed to write block with transactions: %w", err)
+	}
+
+	return nil
+}
+
+// fetchBlockResults fetches block results (finalize_block_events) from the gRPC server.
+// This requires republicd with the GetBlockResults gRPC endpoint (cosmos-sdk feat/grpc-block-results-main).
+// Block results contain consensus-level events: slashing, jailing, validator updates.
+func fetchBlockResults(gRPCClient *client.GRPCClient, blockHeight uint64, maxRetries uint) (*models.BlockResults, error) {
+	blockResultsParams := []byte(fmt.Sprintf(`{"height": %d}`, blockHeight))
+
+	blockResultsBytes, err := utils.GetGRPCResponse(
+		gRPCClient,
+		blockResultsMethodFullName,
+		maxRetries,
+		blockResultsParams,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block results: %w", err)
+	}
+
+	return &models.BlockResults{
+		Height: blockHeight,
+		Data:   blockResultsBytes,
+	}, nil
+}
+
+// processSingleBlockWithResultsAndRetry fetches a block, its transactions, and block results.
+// Block results are fetched via the GetBlockResults gRPC endpoint which provides
+// finalize_block_events (slashing, jailing, validator updates).
+func processSingleBlockWithResultsAndRetry(gRPCClient *client.GRPCClient, blockHeight uint64, outputHandler output.OutputHandler, maxRetries uint) error {
+	// First, process the block and transactions normally
+	if err := processSingleBlockWithRetry(gRPCClient, blockHeight, outputHandler, maxRetries); err != nil {
+		return err
+	}
+
+	// Then fetch and write block results
+	blockResults, err := fetchBlockResults(gRPCClient, blockHeight, maxRetries)
+	if err != nil {
+		// Log warning but don't fail - node might not support GetBlockResults
+		slog.Warn("Failed to fetch block results (node may not support GetBlockResults)", "height", blockHeight, "error", err)
+		return nil
+	}
+
+	if err := outputHandler.WriteBlockResults(gRPCClient.Ctx, blockResults); err != nil {
+		return fmt.Errorf("failed to write block results: %w", err)
 	}
 
 	return nil
